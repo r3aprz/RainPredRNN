@@ -30,7 +30,8 @@ def normalize_image(img):
 
 # Dataset personalizzato per caricare i file TIFF
 class RadarDataset(Dataset):
-    def __init__(self, data_path='/home/f.demicco/RainPredRNN/recupero_tiff/tiffs/2025/', input_length=12, pred_length=6):
+    
+    def __init__(self, data_path='/home/f.demicco/RainPredRNN/recupero_tiff/tiffs/2025/', input_length=6, pred_length=6):
         self.input_length = input_length
         self.pred_length = pred_length
         self.seq_length = input_length + pred_length
@@ -39,33 +40,65 @@ class RadarDataset(Dataset):
             # transforms.Resize((550, 550)),
             transforms.ToTensor(),
         ])
-        self.valid_files = []
-        for file in self.files:
-            try:
-                with rasterio.open(file) as src:
-                    if src.count > 0:
-                        self.valid_files.append(file)
-            except RasterioIOError:
-                print(f"File non valido: {file}")
+        
+        # Cache per tenere traccia della validità dei file
+        self.file_validity = {}
+        
+        # Calcolo finestre valide
+        self.valid_indices = []
+        self.total_possible_windows = max(0, len(self.files) - self.seq_length + 1)
+        
+        for start_idx in range(self.total_possible_windows):
+            window_valid = True
+            for i in range(self.seq_length):
+                file = self.files[start_idx + i]
+                
+                # Verifica validità del file solo se non già controllato
+                if file not in self.file_validity:
+                    try:
+                        with rasterio.open(file) as src:
+                            valid = src.count > 0
+                    except RasterioIOError:
+                        valid = False
+                        print(f"File non valido: {file}")
+                    self.file_validity[file] = valid
+                
+                if not self.file_validity[file]:
+                    window_valid = False
+                    break  # Interrompe il ciclo alla prima occorrenza di file non valido
+                
+            if window_valid:
+                self.valid_indices.append(start_idx)
+        
+        # Statistiche finali
+        self.total_files = len(self.files)
+        self.invalid_files = sum(1 for valid in self.file_validity.values() if not valid)
+        self.valid_windows = len(self.valid_indices)
+        self.invalid_windows = self.total_possible_windows - self.valid_windows
+        
+        print(f"\nStatistiche Dataset:")
+        print(f"1. File totali: {self.total_files}")
+        print(f"2. File non validi: {self.invalid_files}")
+        print(f"3. Finestre totali possibili: {self.total_possible_windows}")
+        print(f"4. Finestre valide: {self.valid_windows}")
+        print(f"5. Finestre non valide: {self.invalid_windows}")
 
     def __len__(self):
-        return len(self.valid_files) - self.seq_length
+        return len(self.valid_indices)
 
     def __getitem__(self, idx):
+        start_idx = self.valid_indices[idx]
         images = []
         for i in range(self.seq_length):
-            with rasterio.open(self.valid_files[idx + i]) as src:
+            file = self.files[start_idx + i]
+            with rasterio.open(file) as src:
                 img = src.read(1).astype(np.float32)
                 img = normalize_image(img)
                 img = Image.fromarray(img)
                 img = self.transform(img)
                 images.append(img)
         images = torch.stack(images)
-        # I primi input_length frame sono in input, i successivi pred_length rappresentano la ground truth futura
-        input_seq = images[:self.input_length]
-        target_seq = images[self.input_length:]
-        return input_seq, target_seq
-
+        return images[:self.input_length], images[self.input_length:]       
 # Definizione della cella ST-LSTM (Spatiotemporal LSTM)
 class ST_LSTMCell(nn.Module):
     def __init__(self, in_channels, hidden_channels, kernel_size=3):
@@ -329,7 +362,8 @@ dataloader = DataLoader(
     shuffle=False, 
     num_workers=4,
     pin_memory=True,
-    prefetch_factor=2  
+    prefetch_factor=2,
+    drop_last=True 
 )  
 model = RainPredRNN().to(device)
 
